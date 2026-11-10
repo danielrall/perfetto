@@ -14,9 +14,9 @@
 
 // Generic result type - similar to Rust's Result<T, E> or ABSL's StatusOr<T>.
 
-export interface ErrorResult {
+export interface ErrorResult<E = string> {
   ok: false;
-  error: string;
+  error: E;
   value: undefined;
 }
 
@@ -25,10 +25,10 @@ export interface OkResult<T> {
   value: T;
 }
 
-export type Result<T = void> = ErrorResult | OkResult<T>;
+export type Result<T = void, E = string> = ErrorResult<E> | OkResult<T>;
 
-export function errResult(message: string): ErrorResult {
-  return {ok: false, error: message, value: undefined};
+export function errResult<E = string>(error: E): ErrorResult<E> {
+  return {ok: false, error, value: undefined};
 }
 
 export function okResult(): OkResult<void>;
