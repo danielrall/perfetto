@@ -219,6 +219,11 @@ W::Offset BuildUtf8(W& w) {
   return w.EndTable();
 }
 
+W::Offset BuildBool(W& w) {
+  w.StartTable();
+  return w.EndTable();
+}
+
 W::Offset BuildNull(W& w) {
   w.StartTable();
   return w.EndTable();
@@ -237,14 +242,18 @@ W::Offset BuildField(W& w,
                      StorageType type,
                      bool nullable,
                      bool all_null,
+                     bool presence,
                      int64_t dictionary_id) {
   uint8_t arrow_type;
   W::Offset type_table;
   W::Offset dictionary;
-  bool has_dictionary = !all_null && type.Is<core::String>();
+  bool has_dictionary = !all_null && !presence && type.Is<core::String>();
   if (all_null) {
     arrow_type = kTypeNull;
     type_table = BuildNull(w);
+  } else if (presence) {
+    arrow_type = kTypeBool;
+    type_table = BuildBool(w);
   } else if (type.Is<core::String>()) {
     arrow_type = kTypeUtf8;
     type_table = BuildUtf8(w);
@@ -414,10 +423,22 @@ base::Status WriteNumericBuffer(uint32_t rows,
   return output.Finish();
 }
 
+base::Status AppendZeros(uint64_t size, BufferedOutput* output) {
+  const uint8_t zeros[kArrowAlignment] = {};
+  while (size) {
+    auto chunk = static_cast<size_t>(
+        std::min<uint64_t>(size, static_cast<uint64_t>(sizeof(zeros))));
+    RETURN_IF_ERROR(output->Append(zeros, chunk));
+    size -= chunk;
+  }
+  return base::OkStatus();
+}
+
 }  // namespace
 
-ArrowSerializer::ArrowSerializer(IdColumnMode id_column_mode)
-    : id_column_mode_(id_column_mode) {}
+ArrowSerializer::ArrowSerializer(IdColumnMode id_column_mode,
+                                 ArrowSparseColumns sparse_columns)
+    : id_column_mode_(id_column_mode), sparse_columns_(sparse_columns) {}
 
 ArrowSerializer::~ArrowSerializer() = default;
 
@@ -509,10 +530,25 @@ base::Status ArrowSerializer::PlanBody(const Dataframe& dataframe,
           CountNulls(plan->rows, column.null_storage.GetNullBitVector());
     }
     if (plan->rows && null_count == plan->rows) {
-      prepared.all_null = true;
+      prepared.layout = Layout::kAllNull;
       plan->nodes.push_back({plan->rows, null_count});
       prepared_columns_.push_back(std::move(prepared));
       continue;
+    }
+    if (sparse && sparse_columns_ == ArrowSparseColumns::kSplit) {
+      PreparedColumn validity_column = prepared;
+      validity_column.name += ".__validity";
+      validity_column.nullable = false;
+      validity_column.layout = Layout::kSparseValidity;
+      plan->buffers.push_back({static_cast<int64_t>(body_cursor), 0});
+      ASSIGN_OR_RETURN(auto bitmap_buffer,
+                       AddBuffer(ValidityBufferSize(plan->rows), &body_cursor));
+      plan->buffers.push_back(bitmap_buffer);
+      plan->nodes.push_back({plan->rows, 0});
+      prepared_columns_.push_back(std::move(validity_column));
+
+      prepared.name += ".__values";
+      prepared.layout = Layout::kSparseValues;
     }
     if (nullable) {
       ASSIGN_OR_RETURN(auto validity_buffer,
@@ -556,7 +592,9 @@ base::Status ArrowSerializer::BuildFileFraming(const BodyPlan& plan) {
     fields.reserve(prepared_columns_.size());
     for (const auto& column : prepared_columns_) {
       fields.push_back(BuildField(w, column.name, column.storage_type,
-                                  column.nullable, column.all_null,
+                                  column.nullable,
+                                  column.layout == Layout::kAllNull,
+                                  column.layout == Layout::kSparseValidity,
                                   static_cast<int64_t>(column.dictionary)));
     }
     auto field_vector =
@@ -719,6 +757,37 @@ base::Status ArrowSerializer::WriteDictionaryIndices(
   return output.Finish();
 }
 
+base::Status ArrowSerializer::WritePackedValues(uint32_t rows,
+                                                const Column& column,
+                                                const PreparedColumn& prepared,
+                                                const WriteFn& write) {
+  uint32_t valid = static_cast<uint32_t>(
+      column.null_storage.GetNullBitVector().CountSetBits());
+  BitVector packed = BitVector::CreateWithSize(valid, true);
+  packed.resize(rows, false);
+  RETURN_IF_ERROR(WriteValidityBuffer(rows, packed, &scratch_, write));
+  BufferedOutput output(&scratch_, write);
+  uint64_t width;
+  if (prepared.storage_type.Is<core::String>()) {
+    const DictionaryPlan& dictionary = dictionaries_[prepared.dictionary];
+    const auto* ids = column.storage.unchecked_data<String>();
+    for (uint32_t i = 0; i < valid; ++i) {
+      const uint32_t* found = dictionary.index_by_id.Find(ids[i].raw_id());
+      PERFETTO_CHECK(found);
+      auto index = static_cast<DictionaryIndex>(*found);
+      RETURN_IF_ERROR(output.Append(&index, sizeof(index)));
+    }
+    width = sizeof(DictionaryIndex);
+  } else {
+    width = NumericSize(prepared.storage_type);
+    RETURN_IF_ERROR(output.Append(NumericData(column.storage),
+                                  static_cast<size_t>(valid * width)));
+  }
+  uint64_t bytes = rows * width;
+  RETURN_IF_ERROR(AppendZeros(AlignToArrow(bytes) - valid * width, &output));
+  return output.Finish();
+}
+
 // Phase 4: materialize the buffers planned by PlanBody(). Each logical column
 // is encoded as validity followed by one fixed-width buffer holding either the
 // numeric values or the dictionary indices.
@@ -726,10 +795,19 @@ base::Status ArrowSerializer::WriteBody(const Dataframe& dataframe,
                                         const WriteFn& write) {
   uint32_t rows = dataframe.row_count();
   for (const auto& prepared : prepared_columns_) {
-    if (prepared.all_null) {
+    const auto& column = *dataframe.columns_[prepared.dataframe_column];
+    if (prepared.layout == Layout::kAllNull) {
       continue;
     }
-    const auto& column = *dataframe.columns_[prepared.dataframe_column];
+    if (prepared.layout == Layout::kSparseValidity) {
+      RETURN_IF_ERROR(WriteValidityBuffer(
+          rows, column.null_storage.GetNullBitVector(), &scratch_, write));
+      continue;
+    }
+    if (prepared.layout == Layout::kSparseValues) {
+      RETURN_IF_ERROR(WritePackedValues(rows, column, prepared, write));
+      continue;
+    }
     Nullability nullability = column.null_storage.nullability();
     bool sparse = IsSparse(nullability);
     const BitVector* validity = nullptr;
