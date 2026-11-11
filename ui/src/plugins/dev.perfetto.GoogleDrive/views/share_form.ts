@@ -20,6 +20,7 @@ import {Callout} from '../../../widgets/callout';
 import {Intent} from '../../../widgets/common';
 import {CopyToClipboardButton} from '../../../widgets/copy_to_clipboard_button';
 import {Form, FormLabel} from '../../../widgets/form';
+import {Icon} from '../../../widgets/icon';
 import {Inline, Stack, StackAuto} from '../../../widgets/stack';
 import {TextInput} from '../../../widgets/text_input';
 import {renderErrorDetails} from '../dialogs';
@@ -110,11 +111,10 @@ function progressText(upload: UploadState): string {
 function renderUploaded(attrs: ShareFormAttrs, fileId: string): m.Children {
   return m(Stack, {className: 'pf-gdrive-share', spacing: 'large'}, [
     renderError(attrs.state),
-    m(
-      Callout,
-      {icon: 'check_circle', intent: Intent.Success},
+    m('.pf-gdrive-share__saved', [
+      m(Icon, {icon: 'cloud_done', filled: true}),
       'Saved to Google Drive',
-    ),
+    ]),
     m(Inline, [
       m(CopyToClipboardButton, {
         label: 'Copy link',

@@ -32,6 +32,15 @@
     margin-top: 8px;
   }
 
+  // Shown once the trace is in Drive: a plain icon and line of text.
+  &__saved {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--pf-color-success);
+    font-weight: 500;
+  }
+
   &__progress-text {
     color: var(--pf-color-text-muted);
     font-size: var(--pf-font-size-s);
