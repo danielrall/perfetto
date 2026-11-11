@@ -19,8 +19,42 @@ import {queryStore, TERMINAL_STATUSES} from './query_store';
 import {makeQueryResponse} from '../pages/query_tabs_state';
 import type {BigTraceEditorTab} from '../pages/query_tabs_state';
 
-const POLL_INTERVAL_MS = 3000;
-const POLL_RETRY_MS = 1000;
+// Polling cadence:
+// - Fast initial cadence (3s) for responsive results on short runs (<30s).
+// - Stepped backoff (6s, 10s) as run duration lengthens, saving ~65% of polling traffic.
+// - Decelerate to 30s when the tab is hidden in the background (document.hidden).
+// - Exponential backoff on transient errors (3s -> 6s -> 12s -> 24s -> 30s max) instead
+//   of rapid retry bursts.
+export const POLL_INTERVAL_FAST_MS = 3000;
+export const POLL_INTERVAL_MID_MS = 6000;
+export const POLL_INTERVAL_SLOW_MS = 10000;
+export const POLL_INTERVAL_HIDDEN_MS = 30000;
+export const POLL_RETRY_BASE_MS = 3000;
+export const POLL_RETRY_MAX_MS = 30000;
+
+export function getNextPollDelayMs(options: {
+  readonly startTimeMs?: number;
+  readonly consecutiveErrors?: number;
+  readonly isHidden?: boolean;
+}): number {
+  const {startTimeMs, consecutiveErrors = 0, isHidden = false} = options;
+
+  if (consecutiveErrors > 0) {
+    return Math.min(
+      POLL_RETRY_MAX_MS,
+      POLL_RETRY_BASE_MS * Math.pow(2, consecutiveErrors - 1),
+    );
+  }
+
+  if (isHidden) {
+    return POLL_INTERVAL_HIDDEN_MS;
+  }
+
+  const elapsed = startTimeMs !== undefined ? Date.now() - startTimeMs : 0;
+  if (elapsed < 30_000) return POLL_INTERVAL_FAST_MS;
+  if (elapsed < 120_000) return POLL_INTERVAL_MID_MS;
+  return POLL_INTERVAL_SLOW_MS;
+}
 
 export interface PollingCallbacks {
   readonly redraw: () => void;
@@ -31,13 +65,37 @@ export interface PollingCallbacks {
 // F1 table data source when the Phase 1 preview table is published and again
 // when Phase 2 finishes replacing it with the full table.
 export class PollingController {
+  private visibilityListenerAttached = false;
+  private readonly activeTabs = new Set<BigTraceEditorTab>();
+
   constructor(private readonly cb: PollingCallbacks) {}
+
+  private ensureVisibilityListener(): void {
+    if (this.visibilityListenerAttached) return;
+    if (typeof document === 'undefined') return;
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        // Tab became visible again: immediately kick an active poll on any running tab.
+        for (const tab of this.activeTabs) {
+          if (tab.isLoading && tab.queryUuid) {
+            this.refreshNow(tab);
+          }
+        }
+      }
+    });
+    this.visibilityListenerAttached = true;
+  }
 
   // Begin polling `:status` for the given tab's queryUuid.
   start(tab: BigTraceEditorTab): void {
     if (!tab.queryUuid) return;
 
+    this.ensureVisibilityListener();
+    this.activeTabs.add(tab);
     const generation = ++tab.pollGeneration;
+    const startMs = tab.clientStartTime ?? Date.now();
+    let consecutiveErrors = 0;
 
     const poll = async () => {
       if (tab.pollGeneration !== generation) return;
@@ -50,6 +108,8 @@ export class PollingController {
         );
         if (tab.pollGeneration !== generation || !tab.isLoading) return;
 
+        consecutiveErrors = 0;
+
         if (status !== undefined && status !== null) {
           this.applyStatus(tab, status, generation);
         }
@@ -59,10 +119,17 @@ export class PollingController {
           status.status !== undefined &&
           TERMINAL_STATUSES.has(status.status);
         if (isTerminal) {
+          this.activeTabs.delete(tab);
           await this.finalize(tab, status!, generation);
         } else if (tab.pollInterval !== undefined) {
           tab.isLoading = true;
-          tab.pollInterval = window.setTimeout(poll, POLL_INTERVAL_MS);
+          const delay = getNextPollDelayMs({
+            startTimeMs: startMs,
+            isHidden:
+              typeof document !== 'undefined' &&
+              document.visibilityState === 'hidden',
+          });
+          tab.pollInterval = window.setTimeout(poll, delay);
         }
         this.cb.redraw();
       } catch (e) {
@@ -71,8 +138,12 @@ export class PollingController {
           return;
         }
         console.error('Poll failed:', e);
+        consecutiveErrors++;
         if (tab.pollInterval !== undefined) {
-          tab.pollInterval = window.setTimeout(poll, POLL_RETRY_MS);
+          const retryDelay = getNextPollDelayMs({
+            consecutiveErrors,
+          });
+          tab.pollInterval = window.setTimeout(poll, retryDelay);
         }
         this.cb.redraw();
       }
@@ -84,8 +155,15 @@ export class PollingController {
     tab.pollInterval = window.setTimeout(poll, 0);
   }
 
+  // Force an immediate poll tick (e.g. on user refresh or tab visibility regain).
+  refreshNow(tab: BigTraceEditorTab): void {
+    if (!tab.queryUuid || !tab.isLoading) return;
+    this.start(tab);
+  }
+
   // Stop any active poll timer on a tab.
   stop(tab: BigTraceEditorTab): void {
+    this.activeTabs.delete(tab);
     if (tab.pollInterval !== undefined) {
       window.clearTimeout(tab.pollInterval);
       tab.pollInterval = undefined;
