@@ -13,16 +13,17 @@
 // limitations under the License.
 
 import m from 'mithril';
-import {Icons} from '../../base/semantic_icons';
-import {Anchor} from '../../widgets/anchor';
-import {Button, ButtonVariant} from '../../widgets/button';
-import {Callout} from '../../widgets/callout';
-import {Intent} from '../../widgets/common';
-import {CopyToClipboardButton} from '../../widgets/copy_to_clipboard_button';
-import {Form, FormLabel} from '../../widgets/form';
-import {Inline, Stack, StackAuto} from '../../widgets/stack';
-import {TextInput} from '../../widgets/text_input';
-import {renderErrorDetails} from './dialogs';
+import {Icons} from '../../../base/semantic_icons';
+import {Anchor} from '../../../widgets/anchor';
+import {Button, ButtonVariant} from '../../../widgets/button';
+import {Callout} from '../../../widgets/callout';
+import {Intent} from '../../../widgets/common';
+import {CopyToClipboardButton} from '../../../widgets/copy_to_clipboard_button';
+import {Form, FormLabel} from '../../../widgets/form';
+import {Inline, Stack, StackAuto} from '../../../widgets/stack';
+import {TextInput} from '../../../widgets/text_input';
+import {renderErrorDetails} from '../dialogs';
+import './share_form.scss';
 
 // Everything the "Share to Google Drive" dialog shows for a trace.
 //

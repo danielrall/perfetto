@@ -30,14 +30,13 @@ import {loadGDriveConfig} from './gdrive_config';
 import {alertModal} from './modal_prompt';
 import {openFileFromDeeplink} from './open_from_deeplink';
 import {openFileFromSidebar} from './open_from_sidebar';
-import {ShareForm, type ShareState} from './share_form';
+import {ShareForm, type ShareState} from './views/share_form';
 import {
   openGDriveSharingDialog,
   pickUploadFolder,
   uploadTraceToGDrive,
 } from './share_to_gdrive';
 import {GDRIVE_PLUGIN_ID, parseGDriveTraceArgs} from './trace_args';
-import './styles.scss';
 
 export interface GDriveClients {
   readonly oauth: GoogleOAuthClient;

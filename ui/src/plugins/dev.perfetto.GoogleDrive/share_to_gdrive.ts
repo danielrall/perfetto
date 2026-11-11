@@ -16,7 +16,7 @@ import type {Trace} from '../../public/trace';
 import {describeAuthFailure} from './dialogs';
 import type {GDriveClient} from './gdrive/gdrive_client';
 import type {GoogleOAuthClient} from './gdrive/oauth_client';
-import type {ShareState, UploadState} from './share_form';
+import type {ShareState, UploadState} from './views/share_form';
 
 // The actions behind the buttons of the "Share to Google Drive" dialog. Each
 // one starts from a click on its button, so the Google popup is allowed, and
