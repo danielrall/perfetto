@@ -150,11 +150,13 @@ std::optional<DecompressedBuffer> DecompressToBuffer(CompressionType type,
 
 // As above, but drives an existing `decompressor` (which must be freshly
 // created or Reset()) so a caller can reuse one across calls. See FrameMode for
-// how input past the first frame is handled.
+// how input past the first frame is handled. A non-zero `size_hint` sizes the
+// output buffer when the decompressed size is known.
 std::optional<DecompressedBuffer> DecompressToBuffer(Decompressor& decompressor,
                                                      const uint8_t* data,
                                                      size_t len,
-                                                     FrameMode frame_mode);
+                                                     FrameMode frame_mode,
+                                                     size_t size_hint = 0);
 
 }  // namespace perfetto::trace_processor::util
 

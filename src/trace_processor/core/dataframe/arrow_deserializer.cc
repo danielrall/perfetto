@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +38,7 @@
 #include "src/trace_processor/core/dataframe/dataframe.h"
 #include "src/trace_processor/core/dataframe/types.h"
 #include "src/trace_processor/core/util/bit_vector.h"
+#include "src/trace_processor/util/decompressor.h"
 #include "src/trace_processor/util/flatbuffer_reader.h"
 #include "src/trace_processor/util/trace_blob_view_reader.h"
 
@@ -54,10 +56,15 @@ bool NeedsPopcount(Nullability type) {
 
 class BodyReader {
  public:
+  // |decompressor| is null for uncompressed batches.
   BodyReader(const util::TraceBlobViewReader& data,
              size_t body_offset,
-             util::FlatBufferScalarVec<ArrowBuffer> buffers)
-      : data_(data), body_offset_(body_offset), buffers_(buffers) {}
+             util::FlatBufferScalarVec<ArrowBuffer> buffers,
+             util::Decompressor* decompressor)
+      : data_(data),
+        body_offset_(body_offset),
+        buffers_(buffers),
+        decompressor_(decompressor) {}
 
   base::StatusOr<TraceBlobView> ReadExact(uint64_t expected_size) {
     return Read(expected_size, true);
@@ -75,6 +82,14 @@ class BodyReader {
   // join them into one allocation.
   base::StatusOr<std::vector<TraceBlobView>> ReadExactPieces(
       uint64_t expected_size) {
+    if (decompressor_) {
+      ASSIGN_OR_RETURN(TraceBlobView blob, ReadExact(expected_size));
+      std::vector<TraceBlobView> pieces;
+      if (blob.size()) {
+        pieces.push_back(std::move(blob));
+      }
+      return std::move(pieces);
+    }
     ASSIGN_OR_RETURN(ArrowBuffer buffer, Next(expected_size, true));
     auto size = static_cast<size_t>(buffer.length);
     std::vector<TraceBlobView> pieces = data_.MultiSliceOff(
@@ -94,8 +109,9 @@ class BodyReader {
       return InvalidFile();
     }
     ArrowBuffer buffer = buffers_[next_buffer_++];
-    uint64_t size = static_cast<uint64_t>(buffer.length);
-    if ((exact && size != expected_size) || (!exact && size < expected_size)) {
+    // Compressed buffers are checked once decompressed.
+    if (!decompressor_ && !SizeMatches(static_cast<uint64_t>(buffer.length),
+                                       expected_size, exact)) {
       return InvalidFile();
     }
     return buffer;
@@ -104,18 +120,57 @@ class BodyReader {
   base::StatusOr<TraceBlobView> Read(uint64_t expected_size, bool exact) {
     ASSIGN_OR_RETURN(ArrowBuffer buffer, Next(expected_size, exact));
     if (!buffer.length) {
-      return TraceBlobView{};
+      return SizeMatches(0, expected_size, exact)
+                 ? base::StatusOr<TraceBlobView>(TraceBlobView{})
+                 : base::StatusOr<TraceBlobView>(InvalidFile());
     }
     auto blob =
         data_.SliceOff(body_offset_ + static_cast<size_t>(buffer.offset),
                        static_cast<size_t>(buffer.length));
-    return blob ? base::StatusOr<TraceBlobView>(std::move(*blob))
-                : base::StatusOr<TraceBlobView>(InvalidFile());
+    if (!blob) {
+      return InvalidFile();
+    }
+    if (!decompressor_) {
+      return std::move(*blob);
+    }
+    ASSIGN_OR_RETURN(TraceBlobView data, Decompress(std::move(*blob)));
+    if (!SizeMatches(data.size(), expected_size, exact)) {
+      return InvalidFile();
+    }
+    return std::move(data);
+  }
+
+  // Arrow's compressed buffer: the uncompressed length, then a zstd frame.
+  base::StatusOr<TraceBlobView> Decompress(TraceBlobView blob) {
+    int64_t length;
+    if (blob.size() < sizeof(length)) {
+      return InvalidFile();
+    }
+    memcpy(&length, blob.data(), sizeof(length));
+    TraceBlobView frame =
+        blob.slice_off(sizeof(length), blob.size() - sizeof(length));
+    if (length == kUncompressedBuffer) {
+      return std::move(frame);
+    }
+    decompressor_->Reset();
+    auto decompressed = util::DecompressToBuffer(
+        *decompressor_, frame.data(), frame.size(),
+        util::FrameMode::kSingleFrame, static_cast<size_t>(length));
+    if (!decompressed || static_cast<int64_t>(decompressed->size) != length) {
+      return InvalidFile();
+    }
+    return TraceBlobView(TraceBlob::TakeOwnership(std::move(decompressed->data),
+                                                  decompressed->size));
+  }
+
+  static bool SizeMatches(uint64_t size, uint64_t expected_size, bool exact) {
+    return exact ? size == expected_size : size >= expected_size;
   }
 
   const util::TraceBlobViewReader& data_;
   size_t body_offset_;
   util::FlatBufferScalarVec<ArrowBuffer> buffers_;
+  util::Decompressor* decompressor_;
   uint32_t next_buffer_ = 0;
 };
 
@@ -422,6 +477,7 @@ struct RecordBatchMetadata {
   size_t body_offset;
   util::FlatBufferScalarVec<FieldNode> nodes;
   util::FlatBufferScalarVec<ArrowBuffer> buffers;
+  bool compressed;
 };
 
 struct Message {
@@ -506,14 +562,30 @@ base::StatusOr<RecordBatchMetadata> ReadRecordBatch(
       return InvalidFile();
     }
   }
-  return RecordBatchMetadata{std::move(message.blob), rows, message.body_offset,
-                             nodes, buffers};
+  auto compression = record_batch.Table(record_batch_field::kCompression);
+  if (compression) {
+    if (compression.Scalar<uint8_t>(body_compression_field::kCodec) !=
+            kCompressionZstd ||
+        compression.Scalar<uint8_t>(body_compression_field::kMethod) !=
+            kCompressionMethodBuffer) {
+      return InvalidFile();
+    }
+    if (!util::IsZstdSupported()) {
+      return base::ErrStatus(
+          "Arrow file is zstd compressed but this build of trace processor "
+          "does not support zstd");
+    }
+  }
+  return RecordBatchMetadata{
+      std::move(message.blob),       rows, message.body_offset, nodes, buffers,
+      static_cast<bool>(compression)};
 }
 
 base::StatusOr<std::vector<Dictionary>> ReadDictionaries(
     const util::TraceBlobViewReader& data,
     const LocatedBatches& located,
-    StringPool* pool) {
+    StringPool* pool,
+    util::Decompressor* zstd) {
   size_t base = data.start_offset();
   std::vector<Dictionary> dictionaries;
   dictionaries.reserve(located.dictionaries.size());
@@ -538,7 +610,8 @@ base::StatusOr<std::vector<Dictionary>> ReadDictionaries(
         RecordBatchMetadata values,
         ReadRecordBatch(std::move(message), record_batch, block.body_length,
                         std::nullopt, 1, kUtf8BufferCount));
-    BodyReader reader(data, values.body_offset, values.buffers);
+    BodyReader reader(data, values.body_offset, values.buffers,
+                      values.compressed ? zstd : nullptr);
     ASSIGN_OR_RETURN(Dictionary dictionary,
                      ReadDictionaryValues(&reader, values.rows, pool));
     dictionaries.push_back(std::move(dictionary));
@@ -567,6 +640,8 @@ base::StatusOr<Dataframe> DeserializeFromArrow(
                       column_names.data(), spec.column_specs.data());
 
   ASSIGN_OR_RETURN(LocatedBatches located, LocateBatches(data));
+  std::unique_ptr<util::Decompressor> zstd =
+      util::CreateDecompressor(util::CompressionType::kZstd);
 
   // The spec supplies the schema; the footer says which columns are all-null.
   bool split = sparse_columns == ArrowSparseColumns::kSplit;
@@ -604,7 +679,7 @@ base::StatusOr<Dataframe> DeserializeFromArrow(
     return InvalidFile();
   }
   ASSIGN_OR_RETURN(std::vector<Dictionary> dictionaries,
-                   ReadDictionaries(data, located, pool));
+                   ReadDictionaries(data, located, pool, zstd.get()));
   ASSIGN_OR_RETURN(Message message,
                    ReadMessage(data, located.block, located.message_offset,
                                kHeaderRecordBatch));
@@ -620,7 +695,8 @@ base::StatusOr<Dataframe> DeserializeFromArrow(
   // Phase 3: decode buffers in the same validity-then-values order used by the
   // serializer. Id columns are reconstructed from the record-batch row count
   // because they are implicit and therefore absent from Arrow.
-  BodyReader reader(data, batch.body_offset, batch.buffers);
+  BodyReader reader(data, batch.body_offset, batch.buffers,
+                    batch.compressed ? zstd.get() : nullptr);
   uint32_t serialized_column = 0;
   uint32_t dictionary_index = 0;
   for (uint32_t column_index = 0; column_index < dataframe.column_count();

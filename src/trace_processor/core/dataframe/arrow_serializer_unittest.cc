@@ -33,6 +33,7 @@
 #include "src/trace_processor/core/dataframe/arrow_test_utils.h"
 #include "src/trace_processor/core/dataframe/dataframe.h"
 #include "src/trace_processor/core/dataframe/specs.h"
+#include "src/trace_processor/util/decompressor.h"
 #include "src/trace_processor/util/flatbuffer_reader.h"
 #include "test/gtest_and_gmock.h"
 
@@ -300,6 +301,26 @@ TEST(ArrowSerializerTest, WritesSplitSparseColumnAsValidityAndPackedValues) {
   EXPECT_EQ(ReadBodyValue<int32_t>(bytes, *batch, 3, 0), 11);
   EXPECT_EQ(ReadBodyValue<int32_t>(bytes, *batch, 3, 1), 33);
   EXPECT_EQ(ReadBodyValue<int32_t>(bytes, *batch, 3, 2), 0);
+}
+
+TEST(ArrowSerializerTest, WritesZstdCompressedBuffers) {
+  using namespace arrow_internal;
+  if (!util::IsZstdSupported()) {
+    GTEST_SKIP() << "zstd not supported";
+  }
+  StringPool pool;
+  auto source = MakeDataframe(kUint32NonNull, &pool, uint32_t{10}, uint32_t{20},
+                              uint32_t{30});
+  std::vector<uint8_t> bytes =
+      Serialize(source, pool, ArrowSerializer::IdColumnMode::kOmit,
+                ArrowSparseColumns::kExpand, ArrowCompression::kZstd);
+  auto batch = ReadRecordBatch(bytes);
+
+  ASSERT_TRUE(batch);
+  ASSERT_EQ(batch->buffers.size(), 2u);
+  EXPECT_EQ(batch->buffers[0].length, 0);
+  EXPECT_EQ(ReadBodyValue<int64_t>(bytes, *batch, 1, 0),
+            static_cast<int64_t>(3 * sizeof(uint32_t)));
 }
 
 TEST(ArrowSerializerTest, WritesDictionaryIndicesAndValues) {

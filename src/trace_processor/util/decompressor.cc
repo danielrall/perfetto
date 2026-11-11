@@ -77,13 +77,16 @@ std::unique_ptr<Decompressor> CreateDecompressor(CompressionType type) {
 std::optional<DecompressedBuffer> DecompressToBuffer(Decompressor& decompressor,
                                                      const uint8_t* data,
                                                      size_t len,
-                                                     FrameMode frame_mode) {
+                                                     FrameMode frame_mode,
+                                                     size_t size_hint) {
   using ResultCode = Decompressor::ResultCode;
   // Decompress into one owned buffer sized at 4x the input (the usual ratio) to
   // avoid a regrow, doubling it if that's not enough. Guard the *4 against
   // size_t overflow on 32-bit/Wasm; the grow loop covers any under-estimate.
   decompressor.Feed(data, len);
-  size_t capacity = std::max<size_t>(len > SIZE_MAX / 4 ? len : len * 4, 4096);
+  size_t capacity =
+      size_hint ? size_hint
+                : std::max<size_t>(len > SIZE_MAX / 4 ? len : len * 4, 4096);
   std::unique_ptr<uint8_t[]> buffer(new uint8_t[capacity]);
   size_t size = 0;
   for (;;) {
